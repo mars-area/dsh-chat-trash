@@ -1,0 +1,53 @@
+{
+  "name": "dsh-chat-trash",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Adds Delete chat to the session menu: the log moves to a local trash, and the menu can empty it.",
+  "author": {
+    "name": "mars-area",
+    "url": "https://github.com/mars-area"
+  },
+  "contributors": [
+    {
+      "name": "mars-area",
+      "url": "https://github.com/mars-area"
+    }
+  ],
+  "homepage": "https://github.com/mars-area/dsh-chat-trash",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mars-area/dsh-chat-trash.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "delete-chat"
+  ],
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}
