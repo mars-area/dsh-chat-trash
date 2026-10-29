@@ -1,6 +1,6 @@
 /**
  * Standalone check of the browser half: it evaluates client.js against a stub
- * module loader and asserts the rows the Slots API receives.
+ * module loader and asserts the row the Slots API receives.
  *
  * Made by mars-area — https://github.com/mars-area
  */
@@ -60,20 +60,16 @@ browser.apply({
   },
 })
 
-check('registers two rows', registered.length === 2, registered.length)
-check('first row is Delete chat', registered[0]?.options.id === 'chat-trash-delete', registered[0]?.options)
-check('second row is Empty trash', registered[1]?.options.id === 'chat-trash-empty', registered[1]?.options)
-check('rows follow Copy Session ID (450)', registered[0]?.options.order > 450, registered[0]?.options.order)
+check('registers one row', registered.length === 1, registered.length)
+check('the row is Delete chat', registered[0]?.options.id === 'chat-trash-delete', registered[0]?.options)
+check('the row follows Copy Session ID (450)', registered[0]?.options.order > 450, registered[0]?.options.order)
 
-const deleteOuter = registered[0]?.Component({ sessionId: 'session-1', displayTitle: 'Demo chat' })
-const deleteRow = typeof deleteOuter?.type === 'function' ? deleteOuter.type(deleteOuter.props) : deleteOuter
-check('delete row renders the primitive', deleteRow?.type === MenuItemButton, deleteRow?.type)
-check('delete row label', deleteRow?.props?.children === 'Delete chat\u2026', deleteRow?.props?.children)
-check('delete row carries the trash icon', deleteRow?.props?.icon?.type === IconTrashOutlineRegular, deleteRow?.props?.icon?.type)
-check('delete row selects a handler', typeof deleteRow?.props?.onSelect === 'function', typeof deleteRow?.props?.onSelect)
-
-const emptyRow = registered[1]?.Component({ sessionId: 'session-1', displayTitle: 'Demo chat' })
-check('empty row renders nothing at zero', emptyRow === null, emptyRow)
+const outer = registered[0]?.Component({ sessionId: 'session-1', displayTitle: 'Demo chat' })
+const row = typeof outer?.type === 'function' ? outer.type(outer.props) : outer
+check('renders the primitive', row?.type === MenuItemButton, row?.type)
+check('label', row?.props?.children === 'Delete chat\u2026', row?.props?.children)
+check('carries the trash icon', row?.props?.icon?.type === IconTrashOutlineRegular, row?.props?.icon?.type)
+check('selects a handler', typeof row?.props?.onSelect === 'function', typeof row?.props?.onSelect)
 
 const failed = checks.filter((entry) => !entry.ok)
 console.log(JSON.stringify({ total: checks.length, failed: failed.length, failures: failed }, null, 2))

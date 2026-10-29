@@ -1,16 +1,21 @@
 /**
  * Host half of the chat-trash bundle.
  *
- * A delete is deliberately recoverable. The Session is archived first, so the
- * sidebar drops the row at once through the ordinary Workspace stream, then its
- * stored log moves into `<DSH_HOME>/trash/chat-trash` and its projection-cache
- * row is removed. Nothing here is a supported persistence API: the seam has no
- * delete, so this bundle moves files under it. The browser half owns every
- * button and calls the routes registered below.
+ * Deletes one chat for real: stops its running work, takes the live Session out
+ * of the session store, drops its workspace membership, pin and archive marks,
+ * then removes the stored log and its projection-cache row. Nothing is archived
+ * and nothing is kept in a trash folder.
+ *
+ * Removing the live Session matters: the sidebar lists live sessions as well as
+ * stored ones, so a chat deleted only on disk kept showing under "Ungrouped"
+ * until the next launch.
+ *
+ * DSH has no delete API by design, so this bundle edits the persistence
+ * directory behind the seam.
  *
  * Made by mars-area — https://github.com/mars-area
  */
-import { mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { readdir, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -29,10 +34,6 @@ class Refusal extends Error {
 
 function dshHome() {
   return process.env.DSH_HOME ?? join(homedir(), '.dsh')
-}
-
-function trashRoot() {
-  return join(dshHome(), 'trash', 'chat-trash')
 }
 
 function send(res, status, value) {
@@ -107,12 +108,49 @@ async function findSessionDirectory(sessionId) {
   return undefined
 }
 
-async function trashCount() {
+/**
+ * Remove the live Session from the store. Its `session/disposed` edge makes
+ * persistence drain the last events and close the log handle, and the sidebar
+ * stops listing it at once instead of waiting for the next launch.
+ * Returns false when nothing live held that id.
+ */
+function closeLiveSession(ctx, sessionId) {
+  const store = ctx.get('sessions')
+  if (store === undefined) return false
+
+  const session = store.get?.(sessionId)
+  if (session === undefined) return false
+
   try {
-    return (await readdir(trashRoot())).length
+    const entry = store.liveEntryFor(session)
+    store.detachEntered(entry)
+    return true
   } catch {
-    return 0
+    // A session that already left the store needs no teardown.
+    return false
   }
+}
+
+/**
+ * Take the chat out of the sidebar: stop the turn and its children, then clear
+ * the pin, the workspace membership and any archive mark. Done before the log
+ * is removed so a failed removal cannot leave a row pointing at nothing.
+ */
+async function forgetSession(ctx, sessionId) {
+  const registry = ctx.get('workspaceRegistry')
+  if (registry === undefined) return
+
+  await registry.stopSessionActivity(sessionId)
+  await registry.unpinSession(sessionId).catch(() => {})
+
+  for (const workspace of registry.list()) {
+    if (workspace.sessionIds.includes(sessionId)) {
+      await workspace.detachSession(sessionId).catch(() => {})
+    }
+  }
+
+  // A previously archived chat would otherwise stay in the archived view.
+  await registry.unarchiveSession(sessionId).catch(() => {})
 }
 
 async function deleteChat(ctx, sessionId) {
@@ -120,94 +158,48 @@ async function deleteChat(ctx, sessionId) {
     throw new Refusal(400, 'That is not a Session id.')
   }
 
-  const live = ctx.get('sessions')?.get(sessionId)
-  if (live !== undefined) {
-    throw new Refusal(409, 'This chat is open. Switch to another chat, then delete this one.')
-  }
-
   const directory = await findSessionDirectory(sessionId)
-  if (directory === undefined) {
-    throw new Refusal(404, 'No stored log was found for this chat.')
+  const store = ctx.get('sessions')
+  const live = store?.get?.(sessionId) !== undefined
+
+  if (directory === undefined && !live) {
+    throw new Refusal(404, 'This chat is already gone.')
   }
 
-  const registry = ctx.get('workspaceRegistry')
-  let archived = false
-  if (registry !== undefined) {
+  await forgetSession(ctx, sessionId)
+  closeLiveSession(ctx, sessionId)
+
+  if (directory !== undefined) {
     try {
-      await registry.archiveSession(sessionId, { stopActivity: true })
-      archived = true
+      await rm(directory, { recursive: true, force: true })
+      await rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', `${sessionId}.json`), {
+        force: true,
+      })
     } catch (error) {
-      // An unregistered or already-gone Session is still worth deleting; a real
-      // archive failure is not, because the row would stay visible.
-      if (!/unknown|not found|no such|missing/i.test(String(error?.message ?? ''))) {
-        throw new Refusal(500, `Could not archive the chat first: ${error?.message ?? error}`)
-      }
+      throw new Refusal(
+        500,
+        `The chat left the sidebar, but its log could not be removed: ${error?.message ?? error}`,
+      )
     }
   }
 
-  await mkdir(trashRoot(), { recursive: true })
-  const destination = join(trashRoot(), `${Date.now()}-${sessionId}`)
-  try {
-    await rename(directory, destination)
-  } catch (error) {
-    if (archived) await registry.unarchiveSession(sessionId).catch(() => {})
-    throw new Refusal(500, `Could not move the log into the trash: ${error?.message ?? error}`)
-  }
-
-  await writeFile(
-    join(destination, 'trash.json'),
-    JSON.stringify({ sessionId, deletedAt: new Date().toISOString(), originalPath: directory }, null, 2),
-    'utf8',
-  ).catch(() => {})
-
-  await rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', `${sessionId}.json`), { force: true })
-    .catch(() => {})
-
-  return { sessionId, trashedAt: destination }
-}
-
-async function purgeTrash() {
-  const root = trashRoot()
-  let names
-  try {
-    names = await readdir(root)
-  } catch {
-    return { removed: 0 }
-  }
-  let removed = 0
-  for (const name of names) {
-    try {
-      await rm(join(root, name), { recursive: true, force: true })
-      removed += 1
-    } catch {
-      // Keep the entry and report what did go; the next attempt retries it.
-    }
-  }
-  return { removed }
+  return { sessionId }
 }
 
 export function apply(ctx) {
-  const route = (path, method, handle) => ctx.effect(() => ctx.webServer.register({
+  ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path,
+    path: `${PREFIX}/delete`,
     handler: async (req, res) => {
       if (!sameOrigin(ctx, req)) return send(res, 403, { error: 'Cross-origin request refused.' })
-      if ((req.method ?? 'GET') !== method) return send(res, 405, { error: `Use ${method}.` })
+      if ((req.method ?? 'GET') !== 'POST') return send(res, 405, { error: 'Use POST.' })
       try {
-        send(res, 200, await handle(req, res))
+        const body = await readBody(req)
+        send(res, 200, await deleteChat(ctx, body.sessionId))
       } catch (error) {
         const status = error instanceof Refusal ? error.status : 500
         send(res, status, { error: error?.message ?? String(error) })
       }
     },
   }))
-
-  route(`${PREFIX}/status`, 'GET', async () => ({ count: await trashCount() }))
-
-  route(`${PREFIX}/delete`, 'POST', async (req) => {
-    const body = await readBody(req)
-    return await deleteChat(ctx, body.sessionId)
-  })
-
-  route(`${PREFIX}/purge`, 'POST', async () => await purgeTrash())
 }

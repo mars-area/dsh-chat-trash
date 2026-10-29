@@ -1,12 +1,11 @@
 /**
  * Browser half of the chat-trash bundle.
  *
- * Adds two rows to the Session row menu of the workspace sidebar:
- * "Delete chat…" for the row it was opened on, and "Empty trash (n)" once the
- * local trash holds something. Both call the host routes the other half of this
- * bundle registers.
+ * Adds one row, "Delete chat…", to the Session row menu of the workspace
+ * sidebar. It calls the host route the other half registers and reloads the
+ * page, because the deleted chat must not stay on screen.
  *
- * Rows render through the workspace bundle's own `MenuItemButton` from
+ * The row renders through the workspace bundle's own `MenuItemButton` from
  * `@deepseek-ai/dsh-client-ui-primitives`, the same primitive the shipped Pin,
  * Rename, Fork and Archive rows use, so typography, padding and the icon seat
  * match them exactly. If that module ever leaves the shared table, a plain
@@ -31,12 +30,11 @@ window.__ModuleLoader__.load({
 
     const base = '/local-chat-trash'
 
-    function Row({ label, onSelect, separatorBefore }) {
+    function Row({ label, onSelect }) {
       if (MenuItemButton !== undefined) {
         return h(
           MenuItemButton,
           {
-            separatorBefore,
             icon: IconTrash === undefined ? undefined : h(IconTrash, { size: 14 }),
             onSelect,
           },
@@ -67,13 +65,11 @@ window.__ModuleLoader__.load({
     }
 
     async function call(path, body) {
-      const response = await fetch(base + path, body === undefined
-        ? { method: 'GET' }
-        : {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-          })
+      const response = await fetch(base + path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
       const value = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(value.error ?? `Request failed (${response.status}).`)
       return value
@@ -86,46 +82,19 @@ window.__ModuleLoader__.load({
         onSelect: async () => {
           const agreed = window.confirm(
             `Delete \u201c${title}\u201d?\n\n`
-            + 'It moves to the local trash and leaves the sidebar. '
-            + 'Empty the trash from this menu when you want it gone for good.',
+            + 'The chat leaves the sidebar and its history is deleted from this machine. '
+            + 'This cannot be undone.',
           )
           if (!agreed) return
           try {
             await call('/delete', { sessionId })
           } catch (error) {
             window.alert(`Could not delete this chat: ${error.message}`)
+            return
           }
-        },
-      })
-    }
-
-    function EmptyTrash() {
-      const [count, setCount] = React.useState(0)
-
-      React.useEffect(() => {
-        let alive = true
-        call('/status')
-          .then((value) => { if (alive) setCount(value.count ?? 0) })
-          .catch(() => {})
-        return () => { alive = false }
-      }, [])
-
-      if (count === 0) return null
-
-      return h(Row, {
-        label: `Empty trash (${count})`,
-        separatorBefore: true,
-        onSelect: async () => {
-          const agreed = window.confirm(
-            `Permanently delete ${count} trashed chat${count === 1 ? '' : 's'}?\n\nThis cannot be undone.`,
-          )
-          if (!agreed) return
-          try {
-            await call('/purge', {})
-            setCount(0)
-          } catch (error) {
-            window.alert(`Could not empty the trash: ${error.message}`)
-          }
+          // The log is gone; reload so the conversation pane cannot keep showing
+          // a chat that no longer exists.
+          window.location.reload()
         },
       })
     }
@@ -136,10 +105,6 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register(
           { name: 'sidebar.workspaces.session.menu.item', id: 'chat-trash-delete', order: 470 },
           DeleteChat,
-        ))
-        ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register(
-          { name: 'sidebar.workspaces.session.menu.item', id: 'chat-trash-empty', order: 480 },
-          EmptyTrash,
         ))
       },
     }

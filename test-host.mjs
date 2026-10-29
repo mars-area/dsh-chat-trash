@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -9,16 +10,61 @@ const { Readable } = require('node:stream')
 const root = process.env.TEST_HOME
 const sessionId = 'session-11111111-2222-3333-4444-555555555555'
 const routes = new Map()
-const archived = []
-const unarchived = []
+const calls = {
+  stop: [],
+  unpin: [],
+  unarchive: [],
+  detach: [],
+  detached: 0,
+  archive: 0,
+  logExistedAtDetach: null,
+}
 let live = false
 
+const sessionDir = join(root, 'sessions', '--F-demo--', sessionId)
+const cacheFile = join(root, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
+const logFile = join(sessionDir, 'session.v4.jsonl.zstd')
+
+const liveSession = { id: sessionId }
+
+const store = {
+  get(id) {
+    return live && id === sessionId ? liveSession : undefined
+  },
+  liveEntryFor(session) {
+    return { id: session.id }
+  },
+  detachEntered() {
+    calls.detached += 1
+    calls.logExistedAtDetach = existsSync(logFile)
+    live = false
+  },
+}
+
+const workspace = {
+  sessionIds: [sessionId],
+  async detachSession(id) {
+    calls.detach.push(id)
+    this.sessionIds = this.sessionIds.filter((entry) => entry !== id)
+  },
+}
+
 const fakeRegistry = {
-  async archiveSession(id, options) {
-    archived.push({ id, options })
+  async archiveSession() {
+    calls.archive += 1
+    throw new Error('archive must not be used')
+  },
+  async stopSessionActivity(id) {
+    calls.stop.push(id)
+  },
+  async unpinSession(id) {
+    calls.unpin.push(id)
   },
   async unarchiveSession(id) {
-    unarchived.push(id)
+    calls.unarchive.push(id)
+  },
+  list() {
+    return [workspace]
   },
 }
 
@@ -33,7 +79,7 @@ const ctx = {
   effect(fn) { return fn() },
   get(name) {
     if (name === 'workspaceRegistry') return fakeRegistry
-    if (name === 'sessions') return { get: (id) => (live && id === sessionId ? { id } : undefined) }
+    if (name === 'sessions') return store
     return undefined
   },
 }
@@ -50,10 +96,9 @@ function call(path, method, body) {
     req.headers = {}
     const res = {
       status: 0,
-      payload: undefined,
       writableEnded: false,
       writeHead(status) { this.status = status },
-      end(text) { this.writableEnded = true; this.payload = text; resolve({ status: this.status, body: JSON.parse(text) }) },
+      end(text) { this.writableEnded = true; resolve({ status: this.status, body: JSON.parse(text) }) },
     }
     route.handler(req, res)
   })
@@ -65,50 +110,45 @@ function check(name, condition, extra) {
   if (!condition) console.log('FAIL', name, extra ?? '')
 }
 
-const sessionDir = join(root, 'sessions', '--F-demo--', sessionId)
-const cacheFile = join(root, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
-await mkdir(sessionDir, { recursive: true })
-await writeFile(join(sessionDir, 'session.v4.jsonl.zstd'), 'log-bytes')
-await mkdir(join(root, 'storages', 'session_projcache', 'sessions'), { recursive: true })
-await writeFile(cacheFile, '{"title":"demo"}')
+async function seed() {
+  await mkdir(sessionDir, { recursive: true })
+  await writeFile(logFile, 'log-bytes')
+  await mkdir(join(root, 'storages', 'session_projcache', 'sessions'), { recursive: true })
+  await writeFile(cacheFile, '{"title":"demo"}')
+}
 
-const deleted = await call('/local-chat-trash/delete', 'POST', { sessionId })
-check('delete status 200', deleted.status === 200, deleted)
-check('archive called with stopActivity', archived.length === 1 && archived[0].options.stopActivity === true, archived)
-check('session directory moved away', await stat(sessionDir).then(() => false, () => true))
-check('projection cache removed', await stat(cacheFile).then(() => false, () => true))
-
-const status1 = await call('/local-chat-trash/status', 'GET')
-check('trash count is 1', status1.body.count === 1, status1.body)
-
-const trashDir = join(root, 'trash', 'chat-trash')
-const names = (await import('node:fs/promises')).readdir ? await (await import('node:fs/promises')).readdir(trashDir) : []
-check('one trash entry', names.length === 1, names)
-const entry = join(trashDir, names[0])
-const manifest = JSON.parse(await readFile(join(entry, 'trash.json'), 'utf8'))
-check('manifest names the original path', manifest.originalPath === sessionDir, manifest)
-check('log survived the move', (await readFile(join(entry, 'session.v4.jsonl.zstd'), 'utf8')) === 'log-bytes')
-
+// 1. A live, opened chat: the store entry must go before the log does.
 live = true
-await mkdir(sessionDir, { recursive: true })
-await writeFile(join(sessionDir, 'session.v4.jsonl.zstd'), 'second')
-const refused = await call('/local-chat-trash/delete', 'POST', { sessionId })
-check('open chat refused with 409', refused.status === 409, refused)
-check('refusal left the log in place', await stat(join(sessionDir, 'session.v4.jsonl.zstd')).then(() => true, () => false))
-live = false
+await seed()
+const deleted = await call('/local-chat-trash/delete', 'POST', { sessionId })
+check('delete answers 200', deleted.status === 200, deleted)
+check('running work is stopped', calls.stop.includes(sessionId), calls.stop)
+check('live session detached from the store', calls.detached === 1, calls.detached)
+check('log still present while detaching', calls.logExistedAtDetach === true, calls.logExistedAtDetach)
+check('pin cleared', calls.unpin.includes(sessionId), calls.unpin)
+check('archive mark cleared', calls.unarchive.includes(sessionId), calls.unarchive)
+check('detached from the workspace', calls.detach.includes(sessionId), calls.detach)
+check('session directory removed', await stat(sessionDir).then(() => false, () => true))
+check('projection cache removed', await stat(cacheFile).then(() => false, () => true))
+check('nothing archived', calls.archive === 0, calls.archive)
+check('no trash folder created', await stat(join(root, 'trash')).then(() => false, () => true))
 
+// 2. A live chat whose log is already gone (leftovers of an older delete).
+live = true
+await rm(sessionDir, { recursive: true, force: true })
+const orphan = await call('/local-chat-trash/delete', 'POST', { sessionId })
+check('a live chat without a log is cleaned up', orphan.status === 200, orphan)
+check('its store entry is gone too', calls.detached === 2, calls.detached)
+
+// 3. Refusals.
+live = false
 const bad = await call('/local-chat-trash/delete', 'POST', { sessionId: '../../etc/passwd' })
 check('path-like id refused', bad.status === 400, bad)
 
-const purge = await call('/local-chat-trash/purge', 'POST', {})
-check('purge removed one entry', purge.body.removed === 1, purge.body)
-const status2 = await call('/local-chat-trash/status', 'GET')
-check('trash empty after purge', status2.body.count === 0, status2.body)
-
 await rm(join(root, 'sessions'), { recursive: true, force: true })
 const missing = await call('/local-chat-trash/delete', 'POST', { sessionId })
-check('missing log answers 404', missing.status === 404, missing)
+check('an absent chat answers 404', missing.status === 404, missing)
 
-const failed = checks.filter((c) => !c.ok)
-console.log(JSON.stringify({ total: checks.length, failed: failed.length, failures: failed }, null, 2))
-process.exit(failed.length === 0 ? 0 : 1)
+const failedChecks = checks.filter((item) => !item.ok)
+console.log(JSON.stringify({ total: checks.length, failed: failedChecks.length, failures: failedChecks }, null, 2))
+process.exit(failedChecks.length === 0 ? 0 : 1)
